@@ -4,8 +4,10 @@ from PIL import Image, ImageTk
 import pigpio
 import threading
 import time
-import picamera
-import picamera.array
+from picamera2 import Picamera2
+from picamera2.encoders import JpegEncoder
+from picamera2.outputs import FileOutput
+
 import io
 import numpy as np
 
@@ -186,40 +188,24 @@ class RoboticArmGUI:
     def camera_loop(self):
         """Continuous camera capture loop in a separate thread"""
         try:
-            with picamera.PiCamera() as camera:
-                camera.resolution = (640, 480)
-                camera.framerate = 30
-                # Allow camera to warm up
-                time.sleep(2)
+            picam2 = Picamera2()
+            config = picam2.create_preview_configuration(main={"size": (640, 480)})
+            picam2.configure(config)
+            picam2.start()
+            
+            # Continuous capture as long as the application is running
+            while self.camera_running:
+                # Capture frame
+                frame = picam2.capture_array()
                 
-                # Create in-memory stream
-                stream = io.BytesIO()
+                # Update the GUI with the new frame
+                self.update_frame(frame)
                 
-                # Continuous capture as long as the application is running
-                while self.camera_running:
-                    # Clear the stream and prepare for next frame
-                    stream.seek(0)
-                    stream.truncate()
-                    
-                    # Capture frame directly as JPEG
-                    camera.capture(stream, format='jpeg', use_video_port=True)
-                    
-                    # Convert to a numpy array
-                    stream.seek(0)
-                    data = np.frombuffer(stream.getvalue(), dtype=np.uint8)
-                    
-                    # Decode the image using OpenCV
-                    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                    
-                    # Update the GUI with the new frame
-                    self.update_frame(image)
-                    
-                    # Sleep briefly to reduce CPU usage
-                    time.sleep(0.01)
+                # Sleep briefly to reduce CPU usage
+                time.sleep(0.01)
         except Exception as e:
             print(f"Camera thread error: {e}")
             self.root.after(0, self.handle_camera_failure)
-
     def update_frame(self, frame):
         """Update the GUI with a new camera frame"""
         if not self.camera_running:
