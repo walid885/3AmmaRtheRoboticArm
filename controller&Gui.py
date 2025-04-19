@@ -4,8 +4,9 @@ from PIL import Image, ImageTk
 import pigpio
 import threading
 import time
-import picamera
-import picamera.array
+from picamera2 import Picamera2
+from picamera2.encoders import JpegEncoder
+from picamera2.outputs import FileOutput
 import io
 import numpy as np
 
