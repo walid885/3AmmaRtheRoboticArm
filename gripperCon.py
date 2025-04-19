@@ -4,6 +4,10 @@ from PIL import Image, ImageTk
 import pigpio
 import threading
 import time
+import picamera
+import picamera.array
+import io
+import numpy as np
 
 class RoboticArmGUI:
     def __init__(self, root):
@@ -62,9 +66,12 @@ class RoboticArmGUI:
         
         # Camera failure flag
         self.camera_failed = False
-
-        # Initialize camera
-        self.init_camera()
+        
+        # Flag to indicate if camera thread should run
+        self.camera_running = True
+        
+        # Pi Camera thread
+        self.init_picamera()
 
     def create_button_frame(self, group_name, button_names, bg_color, fg_color):
         frame = tk.Frame(self.controls_frame, bg="#f0f0f0")
@@ -151,6 +158,12 @@ class RoboticArmGUI:
             # Update status to show no active servo
             if not self.button_states:
                 self.servo_status.config(text="No servo activated")
+                
+                # Reset servo pulse to middle position if no keys are pressed
+                # This prevents continuous power to the servo when not in use
+                # Comment this line if you want the servo to hold its position
+                # self.current_pw = 1500  # Reset to middle position
+                # self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, self.current_pw)
 
     def get_current_pw(self, pin):
         """Get current pulse width or return middle position if servo is off"""
@@ -159,25 +172,84 @@ class RoboticArmGUI:
             return 1500  # Return middle position
         return current_pw
 
-    def init_camera(self):
+    def init_picamera(self):
+        """Initialize Pi Camera v2"""
         try:
-            # Explicitly release any existing camera first
-            if hasattr(self, 'cap') and self.cap is not None:
-                self.cap.release()
-                time.sleep(0.5)  # Give the camera time to close properly
-            
-            # Try to connect to camera (0 is usually the default webcam)
-            self.cap = cv2.VideoCapture(0)
-            
-            if not self.cap.isOpened():
-                self.handle_camera_failure()
-            else:
-                # If camera is available, update frames
-                self.camera_failed = False
-                self.update_camera()
+            # Start camera capture in a separate thread
+            self.camera_thread = threading.Thread(target=self.camera_loop)
+            self.camera_thread.daemon = True
+            self.camera_thread.start()
         except Exception as e:
-            print(f"Camera initialization error: {e}")
+            print(f"Pi Camera initialization error: {e}")
             self.handle_camera_failure()
+
+    def camera_loop(self):
+        """Continuous camera capture loop in a separate thread"""
+        try:
+            with picamera.PiCamera() as camera:
+                camera.resolution = (640, 480)
+                camera.framerate = 30
+                # Allow camera to warm up
+                time.sleep(2)
+                
+                # Create in-memory stream
+                stream = io.BytesIO()
+                
+                # Continuous capture as long as the application is running
+                while self.camera_running:
+                    # Clear the stream and prepare for next frame
+                    stream.seek(0)
+                    stream.truncate()
+                    
+                    # Capture frame directly as JPEG
+                    camera.capture(stream, format='jpeg', use_video_port=True)
+                    
+                    # Convert to a numpy array
+                    stream.seek(0)
+                    data = np.frombuffer(stream.getvalue(), dtype=np.uint8)
+                    
+                    # Decode the image using OpenCV
+                    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                    
+                    # Update the GUI with the new frame
+                    self.update_frame(image)
+                    
+                    # Sleep briefly to reduce CPU usage
+                    time.sleep(0.01)
+        except Exception as e:
+            print(f"Camera thread error: {e}")
+            self.root.after(0, self.handle_camera_failure)
+
+    def update_frame(self, frame):
+        """Update the GUI with a new camera frame"""
+        if not self.camera_running:
+            return
+            
+        try:
+            # Convert BGR to RGB for PIL
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Convert to PIL Image
+            image = Image.fromarray(frame_rgb)
+            
+            # Resize to fit our display
+            image = image.resize((600, 450), Image.LANCZOS)
+            
+            # Convert to PhotoImage for Tkinter
+            photo = ImageTk.PhotoImage(image)
+            
+            # Update the label in the main thread
+            self.root.after(0, lambda: self.update_label(photo))
+        except Exception as e:
+            print(f"Frame update error: {e}")
+
+    def update_label(self, photo):
+        """Update the label with a new photo (called in main thread)"""
+        try:
+            self.photo = photo  # Store reference to prevent garbage collection
+            self.camera_label.config(image=self.photo)
+        except Exception as e:
+            print(f"Label update error: {e}")
 
     def handle_camera_failure(self):
         self.camera_failed = True
@@ -200,53 +272,29 @@ class RoboticArmGUI:
 
     def retry_camera(self):
         print("Attempting to reconnect to camera...")
-        self.init_camera()
-
-    def update_camera(self):
-        if self.camera_failed:
-            return
-            
-        try:
-            ret, frame = self.cap.read()
-            if ret:
-                # Convert from BGR (OpenCV format) to RGB (PIL format)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Convert to PIL Image and then to Tkinter PhotoImage
-                image = Image.fromarray(frame)
-                # Resize to fit our display if needed
-                image = image.resize((600, 450), Image.LANCZOS)
-                self.photo = ImageTk.PhotoImage(image)
-                
-                # Update the label
-                self.camera_label.config(image=self.photo)
-                self.camera_label.image = self.photo # Keep a reference
-            else:
-                print("Failed to get frame from camera")
-                self.handle_camera_failure()
-                return
-            
-            # Update every 10ms (approximately 100 fps max)
-            self.root.after(10, self.update_camera)
-        except Exception as e:
-            print(f"Camera update error: {e}")
-            self.handle_camera_failure()
+        self.camera_failed = False
+        self.init_picamera()
 
     def cleanup(self):
+        """Clean up resources when closing the application"""
+        print("Cleaning up resources...")
+        
+        # Stop camera thread
+        self.camera_running = False
+        if hasattr(self, 'camera_thread'):
+            # Give camera thread time to stop
+            time.sleep(0.5)
+        
         # Clear any button states
         self.button_states.clear()
         
-        # Turn off the servo
+        # Turn off the servo by stopping pulse (THIS IS THE KEY CHANGE)
         if hasattr(self, 'pi') and self.pi.connected:
-            self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, 0)
+            print("Turning off servo motor...")
+            self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, 0)  # Stop the pulse
+            time.sleep(0.1)  # Give it a moment to stop
             self.pi.stop()
-            
-        # Release camera
-        try:
-            if hasattr(self, 'cap') and self.cap is not None:
-                self.cap.release()
-        except Exception as e:
-            print(f"Error releasing camera: {e}")
+            print("Servo motor turned off.")
 
 if __name__ == "__main__":
     # Check if pigpio daemon is running
