@@ -15,6 +15,8 @@ class RoboticArmGUI:
         self.GRIPPER_PIN = 17
         self.OPEN_PW = 2000   # Pulse width for open position (μs)
         self.CLOSED_PW = 1000  # Pulse width for closed position (μs)
+        self.SERVO_STEP = 20  # Step size for gradual movement (μs)
+        self.SERVO_INTERVAL = 50  # Interval between steps (ms)
         
         # Initialize pigpio
         self.pi = pigpio.pi()
@@ -24,7 +26,8 @@ class RoboticArmGUI:
             tk.messagebox.showerror("Connection Error", "Failed to connect to pigpio daemon!")
 
         # Set gripper to middle position initially
-        self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, 1500)
+        self.current_pw = 1500
+        self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, self.current_pw)
 
         # Configure grid layout
         self.root.grid_columnconfigure(0, weight=3) # Camera display
@@ -56,6 +59,9 @@ class RoboticArmGUI:
 
         # Dictionary to track button states (pressed or released)
         self.button_states = {}
+        
+        # Camera failure flag
+        self.camera_failed = False
 
         # Initialize camera
         self.init_camera()
@@ -108,25 +114,27 @@ class RoboticArmGUI:
         # Print information
         print(f"{button_id}")
         
-        # For B3 buttons, control the gripper
+        # Start continuous movement for the gripper
         if "BLACK B3" in button_id or "BLUE B3" in button_id:
-            if "CCW" in button_id:  # Open gripper
-                self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, self.OPEN_PW)
-                print(f"Opening gripper: {self.OPEN_PW}μs")
-            elif "CW" in button_id:  # Close gripper
-                self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, self.CLOSED_PW)
-                print(f"Closing gripper: {self.CLOSED_PW}μs")
-        
-        # Start continuous status updates
-        self.update_button_status(button_id)
+            self.move_servo_continuously(button_id)
 
-    def update_button_status(self, button_id):
+    def move_servo_continuously(self, button_id):
         # Only proceed if button is still pressed
         if button_id in self.button_states and self.button_states[button_id]:
-            print(f"ACTIVE: {button_id}")
+            # Determine direction
+            if "CCW" in button_id:  # Open gripper
+                new_pw = min(self.current_pw + self.SERVO_STEP, self.OPEN_PW)
+            else:  # Close gripper
+                new_pw = max(self.current_pw - self.SERVO_STEP, self.CLOSED_PW)
             
-            # Schedule the next update only if button is still pressed
-            self.root.after(100, lambda: self.update_button_status(button_id))
+            # Update position if it changed
+            if new_pw != self.current_pw:
+                self.current_pw = new_pw
+                self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, self.current_pw)
+                print(f"Gripper position: {self.current_pw}μs")
+            
+            # Schedule the next movement only if button is still pressed
+            self.root.after(self.SERVO_INTERVAL, lambda: self.move_servo_continuously(button_id))
 
     def button_release(self, button_id):
         # Check if this button was active
@@ -136,13 +144,6 @@ class RoboticArmGUI:
             
             # Print release information
             print(f"RELEASED: {button_id}")
-            
-            # Handle gripper stop
-            if "BLACK B3" in button_id or "BLUE B3" in button_id:
-                # Stop the gripper movement by holding current position
-                current_pw = self.get_current_pw(self.GRIPPER_PIN)
-                self.pi.set_servo_pulsewidth(self.GRIPPER_PIN, current_pw)
-                print(f"Gripper stopped at: {current_pw}μs")
             
             # Remove from button states
             del self.button_states[button_id]
@@ -159,42 +160,77 @@ class RoboticArmGUI:
         return current_pw
 
     def init_camera(self):
-        # Try to connect to camera (0 is usually the default webcam)
-        self.cap = cv2.VideoCapture(0)
-        
-        if not self.cap.isOpened():
-            # If no camera is available, show a placeholder
-            placeholder = Image.new('RGB', (640, 480), color='darkgray')
-            self.photo = ImageTk.PhotoImage(placeholder)
-            self.camera_label.config(image=self.photo)
-            self.camera_label.image = self.photo
+        try:
+            # Explicitly release any existing camera first
+            if hasattr(self, 'cap') and self.cap is not None:
+                self.cap.release()
+                time.sleep(0.5)  # Give the camera time to close properly
             
-            # Add text overlay
-            text_label = tk.Label(self.camera_label, text="Camera Not Available",
-                                font=("Arial", 18), bg="darkgray", fg="white")
-            text_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
-        else:
-            # If camera is available, update frames
-            self.update_camera()
+            # Try to connect to camera (0 is usually the default webcam)
+            self.cap = cv2.VideoCapture(0)
+            
+            if not self.cap.isOpened():
+                self.handle_camera_failure()
+            else:
+                # If camera is available, update frames
+                self.camera_failed = False
+                self.update_camera()
+        except Exception as e:
+            print(f"Camera initialization error: {e}")
+            self.handle_camera_failure()
+
+    def handle_camera_failure(self):
+        self.camera_failed = True
+        # If no camera is available, show a placeholder
+        placeholder = Image.new('RGB', (640, 480), color='darkgray')
+        self.photo = ImageTk.PhotoImage(placeholder)
+        self.camera_label.config(image=self.photo)
+        self.camera_label.image = self.photo
+        
+        # Add text overlay to camera_label
+        if hasattr(self, 'text_label'):
+            self.text_label.destroy()
+        
+        self.text_label = tk.Label(self.camera_label, text="Camera Not Available\nClick to retry",
+                            font=("Arial", 18), bg="darkgray", fg="white")
+        self.text_label.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        
+        # Add click to retry
+        self.camera_label.bind("<Button-1>", lambda e: self.retry_camera())
+
+    def retry_camera(self):
+        print("Attempting to reconnect to camera...")
+        self.init_camera()
 
     def update_camera(self):
-        ret, frame = self.cap.read()
-        if ret:
-            # Convert from BGR (OpenCV format) to RGB (PIL format)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if self.camera_failed:
+            return
             
-            # Convert to PIL Image and then to Tkinter PhotoImage
-            image = Image.fromarray(frame)
-            # Resize to fit our display if needed
-            image = image.resize((600, 450), Image.LANCZOS)
-            self.photo = ImageTk.PhotoImage(image)
+        try:
+            ret, frame = self.cap.read()
+            if ret:
+                # Convert from BGR (OpenCV format) to RGB (PIL format)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Convert to PIL Image and then to Tkinter PhotoImage
+                image = Image.fromarray(frame)
+                # Resize to fit our display if needed
+                image = image.resize((600, 450), Image.LANCZOS)
+                self.photo = ImageTk.PhotoImage(image)
+                
+                # Update the label
+                self.camera_label.config(image=self.photo)
+                self.camera_label.image = self.photo # Keep a reference
+            else:
+                print("Failed to get frame from camera")
+                self.handle_camera_failure()
+                return
             
-            # Update the label
-            self.camera_label.config(image=self.photo)
-            self.camera_label.image = self.photo # Keep a reference
-        
-        # Update every 10ms (approximately 100 fps max)
-        self.root.after(10, self.update_camera)
+            # Update every 10ms (approximately 100 fps max)
+            self.root.after(10, self.update_camera)
+        except Exception as e:
+            print(f"Camera update error: {e}")
+            self.handle_camera_failure()
 
     def cleanup(self):
         # Clear any button states
@@ -206,8 +242,11 @@ class RoboticArmGUI:
             self.pi.stop()
             
         # Release camera
-        if hasattr(self, 'cap') and self.cap.isOpened():
-            self.cap.release()
+        try:
+            if hasattr(self, 'cap') and self.cap is not None:
+                self.cap.release()
+        except Exception as e:
+            print(f"Error releasing camera: {e}")
 
 if __name__ == "__main__":
     # Check if pigpio daemon is running
