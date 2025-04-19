@@ -16,25 +16,41 @@ class RoboticArmController:
     
     # Min/Max pulse widths (in μs) for each servo
     SERVO_LIMITS = {
-        'BASE': (500, 2500),
-        'SHOULDER': (500, 2500),
+        'BASE': (600, 2400),        # Adjusted limits
+        'SHOULDER': (800, 2200),    # Adjusted limits
         'ELBOW': (500, 2500),
         'WRIST_PITCH': (500, 2500),
         'WRIST_ROLL': (500, 2500),
-        'GRIPPER': (1000, 2000)  # Closed to Open
+        'GRIPPER': (800, 2200)      # Adjusted limits for better grip range
     }
     
-    # Default step size and interval for servo movements
-    DEFAULT_STEP = 20      # Step size in μs
-    DEFAULT_INTERVAL = 50  # Interval between steps in ms
+    # Step sizes for different servos (different servos may need different step sizes)
+    STEP_SIZES = {
+        'BASE': 10,       # Smaller steps for smoother base movement
+        'SHOULDER': 15,   # Smaller steps for smoother shoulder movement
+        'ELBOW': 20,
+        'WRIST_PITCH': 20,
+        'WRIST_ROLL': 20,
+        'GRIPPER': 25     # Larger steps for responsive gripper
+    }
+    
+    # Speed intervals for different servos (ms)
+    SPEED_INTERVALS = {
+        'BASE': 30,      # Slower for base (more stable)
+        'SHOULDER': 30,  # Slower for shoulder (more stable)
+        'ELBOW': 40,
+        'WRIST_PITCH': 40,
+        'WRIST_ROLL': 40,
+        'GRIPPER': 30    # Quick gripper response
+    }
 
     def __init__(self, root):
         self.root = root
         self.root.title("6-DOF Robotic Arm Control")
         self.root.geometry("800x600")
         
-        # Initialize pigpio
-        self.pi = pigpio.pi()
+        # Initialize pigpio with multiple connection attempts
+        self.pi = self.connect_to_pigpio(max_attempts=3)
         if not self.pi.connected:
             print("Failed to connect to pigpio daemon!")
             tk.messagebox.showerror("Connection Error", "Failed to connect to pigpio daemon!")
@@ -44,25 +60,84 @@ class RoboticArmController:
         self.current_pw = {pin_name: 1500 for pin_name in self.SERVO_PINS}
         
         # Active servo tracking (None means no servo is active)
-        self.active_servo = None
+        self.active_servos = set()  # Allow multiple active servos
         
         # Button states tracking
         self.button_states = {}
+        
+        # Movement threads dict
+        self.movement_threads = {}
         
         self._setup_ui()
         
         # Initialize all servos to middle position then turn them off
         self.initialize_servos()
+        
+        # Add heartbeat to verify servo connection
+        self.root.after(5000, self.check_servo_connections)
+
+    def connect_to_pigpio(self, max_attempts=3):
+        """Try to connect to pigpio daemon with multiple attempts"""
+        for attempt in range(max_attempts):
+            pi = pigpio.pi()
+            if pi.connected:
+                print(f"Connected to pigpio daemon on attempt {attempt+1}")
+                return pi
+            print(f"Connection attempt {attempt+1} failed, retrying...")
+            time.sleep(1)
+        return pi  # Return last attempt even if failed
+
+    def check_servo_connections(self):
+        """Periodically check if servos are responsive"""
+        if not self.pi.connected:
+            self.servo_status.config(text="ERROR: Lost connection to pigpio!")
+            # Try to reconnect
+            self.pi = self.connect_to_pigpio()
+            if self.pi.connected:
+                self.servo_status.config(text="Reconnected to pigpio")
+        
+        # Test problematic servos
+        problem_servos = []
+        test_servos = ['BASE', 'SHOULDER', 'GRIPPER']
+        
+        for servo in test_servos:
+            pin = self.SERVO_PINS[servo]
+            # Quick pulse test
+            current = self.current_pw[servo]
+            try:
+                self.pi.set_servo_pulsewidth(pin, current)
+                time.sleep(0.1)
+                self.pi.set_servo_pulsewidth(pin, 0)  # Turn off
+            except Exception as e:
+                problem_servos.append(f"{servo} ({e})")
+        
+        if problem_servos:
+            self.servo_status.config(text=f"WARNING: Issues with {', '.join(problem_servos)}")
+        
+        # Schedule next check
+        self.root.after(30000, self.check_servo_connections)  # Check every 30 seconds
 
     def initialize_servos(self):
         """Initialize all servos to middle position then turn them off"""
         # First set all to middle position
         for name, pin in self.SERVO_PINS.items():
-            self.pi.set_servo_pulsewidth(pin, self.current_pw[name])
-            time.sleep(0.1)  # Brief pause to allow servo to reach position
+            # Use safe middle position within limits
+            min_pw, max_pw = self.SERVO_LIMITS[name]
+            middle_pw = (min_pw + max_pw) // 2
+            self.current_pw[name] = middle_pw
+            
+            try:
+                self.pi.set_servo_pulsewidth(pin, middle_pw)
+                # Update position label
+                if hasattr(self, 'position_labels') and name in self.position_labels:
+                    self.position_labels[name].config(text=f"{middle_pw}μs")
+            except Exception as e:
+                print(f"Error initializing {name}: {e}")
+            
+            time.sleep(0.2)  # Longer pause to allow servo to reach position
         
         # Then turn all off to save power
-        time.sleep(0.5)  # Wait for servos to reach position
+        time.sleep(1.0)  # Wait for servos to reach position
         for name, pin in self.SERVO_PINS.items():
             self.pi.set_servo_pulsewidth(pin, 0)  # Stop the pulse
 
@@ -106,10 +181,15 @@ class RoboticArmController:
             label_frame = tk.Frame(self.feedback_frame, bg="#f0f0f0")
             label_frame.grid(row=row, column=col, padx=10, pady=5)
             
-            tk.Label(label_frame, text=f"{name}:", font=("Arial", 10), 
+            # Show valid range for each servo
+            min_pw, max_pw = self.SERVO_LIMITS[name]
+            range_text = f"{name} ({min_pw}-{max_pw}):"
+            
+            tk.Label(label_frame, text=range_text, font=("Arial", 10), 
                      bg="#f0f0f0").pack(side=tk.LEFT)
             
-            self.position_labels[name] = tk.Label(label_frame, text="1500μs", 
+            # Initialize position label with middle position
+            self.position_labels[name] = tk.Label(label_frame, text=f"{self.current_pw[name]}μs", 
                                                   font=("Arial", 10), width=8, 
                                                   bg="white", relief=tk.SUNKEN)
             self.position_labels[name].pack(side=tk.LEFT, padx=5)
@@ -128,6 +208,18 @@ class RoboticArmController:
                                  ["WRIST_PITCH", "WRIST_ROLL", "GRIPPER"], 
                                  "#773355", "white", 1)
         
+        # Add speed control slider
+        speed_frame = tk.Frame(main_frame, bg="#f0f0f0")
+        speed_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Label(speed_frame, text="Movement Speed:", bg="#f0f0f0").pack(side=tk.LEFT, padx=10)
+        
+        self.speed_factor = tk.DoubleVar(value=1.0)
+        speed_slider = tk.Scale(speed_frame, from_=0.5, to=2.0, resolution=0.1,
+                                orient=tk.HORIZONTAL, length=200, variable=self.speed_factor,
+                                bg="#f0f0f0", label="Speed Factor")
+        speed_slider.pack(side=tk.LEFT, padx=10)
+        
         # Create preset positions buttons
         preset_frame = tk.Frame(main_frame, bg="#f0f0f0")
         preset_frame.pack(fill=tk.X, pady=15)
@@ -143,7 +235,8 @@ class RoboticArmController:
             ("Home", self.home_position),
             ("Pick", self.pick_position),
             ("Place", self.place_position),
-            ("Rest", self.rest_position)
+            ("Rest", self.rest_position),
+            ("Test Servos", self.test_all_servos)  # Added test function
         ]
         
         for i, (name, command) in enumerate(presets):
@@ -173,7 +266,10 @@ class RoboticArmController:
             button_frame = tk.Frame(button_container, bg="#f0f0f0", padx=10, pady=5)
             button_frame.grid(row=0, column=i)
             
-            label = tk.Label(button_frame, text=name, font=("Arial", 10, "bold"), bg="#f0f0f0")
+            # Show servo name with its specific step size
+            step_size = self.STEP_SIZES[name]
+            label = tk.Label(button_frame, text=f"{name} (Step: {step_size}μs)", 
+                           font=("Arial", 10, "bold"), bg="#f0f0f0")
             label.pack(pady=(0, 5))
             
             btn_frame = tk.Frame(button_frame, bg="#f0f0f0")
@@ -198,6 +294,65 @@ class RoboticArmController:
             cw_btn.bind("<ButtonPress-1>", lambda event, bid=button_id: self.button_press(bid))
             cw_btn.bind("<ButtonRelease-1>", lambda event, bid=button_id: self.button_release(bid))
 
+    def test_all_servos(self):
+        """Test all servos with a small movement to verify they're working"""
+        self.stop_all_servos()
+        self.servo_status.config(text="Testing all servos...")
+        
+        # Create a thread for testing
+        threading.Thread(target=self._test_servos_thread, daemon=True).start()
+
+    def _test_servos_thread(self):
+        """Thread for testing each servo individually"""
+        servo_list = list(self.SERVO_PINS.keys())
+        
+        for name in servo_list:
+            pin = self.SERVO_PINS[name]
+            min_pw, max_pw = self.SERVO_LIMITS[name]
+            middle_pw = (min_pw + max_pw) // 2
+            
+            # Update status
+            self.root.after(0, lambda n=name: 
+                           self.servo_status.config(text=f"Testing servo: {n}"))
+            
+            try:
+                # Move to middle
+                self.pi.set_servo_pulsewidth(pin, middle_pw)
+                self.current_pw[name] = middle_pw
+                self.root.after(0, lambda n=name, p=middle_pw: 
+                               self.position_labels[n].config(text=f"{p}μs"))
+                time.sleep(0.5)
+                
+                # Move slightly one way
+                test_pw = middle_pw + 100
+                if test_pw > max_pw:
+                    test_pw = middle_pw - 100
+                
+                self.pi.set_servo_pulsewidth(pin, test_pw)
+                self.current_pw[name] = test_pw
+                self.root.after(0, lambda n=name, p=test_pw: 
+                               self.position_labels[n].config(text=f"{p}μs"))
+                time.sleep(0.5)
+                
+                # Move back to middle
+                self.pi.set_servo_pulsewidth(pin, middle_pw)
+                self.current_pw[name] = middle_pw
+                self.root.after(0, lambda n=name, p=middle_pw: 
+                               self.position_labels[n].config(text=f"{p}μs"))
+                time.sleep(0.5)
+                
+                # Turn off servo
+                self.pi.set_servo_pulsewidth(pin, 0)
+                
+            except Exception as e:
+                self.root.after(0, lambda n=name, err=str(e): 
+                               self.servo_status.config(text=f"Error with {n}: {err}"))
+                time.sleep(1)
+        
+        # Update status when done
+        self.root.after(0, lambda: 
+                       self.servo_status.config(text="Testing complete - All servos off"))
+
     def home_position(self):
         """Move all servos to home position"""
         home_positions = {
@@ -212,6 +367,7 @@ class RoboticArmController:
 
     def pick_position(self):
         """Move to picking position"""
+        # Adjusted positions based on servo limits
         pick_positions = {
             'BASE': 1800,
             'SHOULDER': 1200,
@@ -224,6 +380,7 @@ class RoboticArmController:
 
     def place_position(self):
         """Move to placing position"""
+        # Adjusted positions based on servo limits
         place_positions = {
             'BASE': 1200,
             'SHOULDER': 1500,
@@ -236,6 +393,7 @@ class RoboticArmController:
 
     def rest_position(self):
         """Move to rest position"""
+        # Adjusted positions based on servo limits
         rest_positions = {
             'BASE': 1500,
             'SHOULDER': 2000,
@@ -254,28 +412,46 @@ class RoboticArmController:
         self.servo_status.config(text="Moving to preset position...")
         
         # Create a separate thread for movement to avoid blocking GUI
-        threading.Thread(target=self._move_to_preset_thread, 
-                        args=(positions,), daemon=True).start()
+        move_thread = threading.Thread(target=self._move_to_preset_thread, 
+                        args=(positions,), daemon=True)
+        move_thread.start()
 
     def _move_to_preset_thread(self, target_positions):
         """Thread function for smooth movement to preset positions"""
-        # First, turn on all servos that need to move
+        # First, validate all target positions are within limits
+        for name, target in target_positions.items():
+            min_pw, max_pw = self.SERVO_LIMITS[name]
+            if target < min_pw or target > max_pw:
+                adjusted = max(min_pw, min(target, max_pw))
+                target_positions[name] = adjusted
+                print(f"Warning: {name} target of {target}μs out of range, adjusted to {adjusted}μs")
+        
+        # Turn on all servos that need to move
         for name in target_positions:
             pin = self.SERVO_PINS[name]
             self.pi.set_servo_pulsewidth(pin, self.current_pw[name])
             time.sleep(0.05)  # Short delay between activating each servo
         
-        # Calculate steps for each servo
-        steps = {}
+        # Calculate the maximum number of steps needed for any servo
         current_positions = self.current_pw.copy()
+        max_steps = 1  # Minimum 1 step
         
         for name, target in target_positions.items():
-            if name in self.SERVO_PINS:
-                steps[name] = (target - current_positions[name]) / 50  # 50 steps total
+            distance = abs(target - current_positions[name])
+            steps_needed = distance // 10  # Move in 10μs increments for smoothness
+            max_steps = max(max_steps, steps_needed)
+        
+        # Cap the max steps to avoid too long movements
+        max_steps = min(max_steps, 100)
+        
+        # Calculate increments for each servo
+        increments = {}
+        for name, target in target_positions.items():
+            increments[name] = (target - current_positions[name]) / max_steps
         
         # Move in small increments
-        for step in range(50):
-            for name, increment in steps.items():
+        for step in range(max_steps):
+            for name, increment in increments.items():
                 pin = self.SERVO_PINS[name]
                 new_pw = int(current_positions[name] + increment * (step + 1))
                 
@@ -285,13 +461,18 @@ class RoboticArmController:
                 
                 # Update position
                 self.current_pw[name] = new_pw
-                self.pi.set_servo_pulsewidth(pin, new_pw)
-                
-                # Update UI in main thread
-                self.root.after(0, lambda n=name, p=new_pw: 
-                               self.position_labels[n].config(text=f"{p}μs"))
+                try:
+                    self.pi.set_servo_pulsewidth(pin, new_pw)
+                    
+                    # Update UI in main thread
+                    self.root.after(0, lambda n=name, p=new_pw: 
+                                   self.position_labels[n].config(text=f"{p}μs"))
+                except Exception as e:
+                    print(f"Error moving {name}: {e}")
             
-            time.sleep(0.02)  # 20ms between steps
+            # Adjust sleep time based on speed factor (inverse - lower factor means slower)
+            sleep_time = 0.02 / self.speed_factor.get()
+            time.sleep(sleep_time)
         
         # Hold position briefly
         time.sleep(0.5)
@@ -306,12 +487,17 @@ class RoboticArmController:
         """Turn off all servos to save power"""
         for name, pin in self.SERVO_PINS.items():
             self.pi.set_servo_pulsewidth(pin, 0)
-        self.active_servo = None
+        self.active_servos.clear()
 
     def emergency_stop(self):
         """Stop all servo movements immediately"""
         # Clear button states
         self.button_states.clear()
+        
+        # Stop all movement threads
+        for thread_id in list(self.movement_threads.keys()):
+            self.movement_threads[thread_id] = False
+        self.movement_threads.clear()
         
         # Update status
         self.servo_status.config(text="EMERGENCY STOP ACTIVATED")
@@ -332,20 +518,21 @@ class RoboticArmController:
         # Mark button as pressed
         self.button_states[button_id] = True
         
-        # First, turn off all other servos to ensure sufficient power
-        if self.active_servo != servo_name:
-            self.stop_all_servos()
-            
-            # Activate the requested servo
-            pin = self.SERVO_PINS[servo_name]
-            self.pi.set_servo_pulsewidth(pin, self.current_pw[servo_name])
-            self.active_servo = servo_name
+        # Add servo to active set
+        self.active_servos.add(servo_name)
+        
+        # Activate the requested servo
+        pin = self.SERVO_PINS[servo_name]
+        self.pi.set_servo_pulsewidth(pin, self.current_pw[servo_name])
         
         # Update status display
         self.servo_status.config(text=f"Moving: {servo_name} {direction}")
         
-        # Start continuous movement
-        self.move_servo_continuously(button_id)
+        # Start continuous movement thread
+        thread_id = f"movement_{button_id}"
+        self.movement_threads[thread_id] = True
+        threading.Thread(target=self.move_servo_continuously, 
+                       args=(button_id, thread_id), daemon=True).start()
 
     def button_release(self, button_id):
         """Handle button release events"""
@@ -357,23 +544,48 @@ class RoboticArmController:
             # Remove from button states
             del self.button_states[button_id]
             
-            # If no buttons are pressed, turn off the active servo
-            if not self.button_states:
-                self.stop_all_servos()
-                self.servo_status.config(text="Ready - All servos off")
-
-    def move_servo_continuously(self, button_id):
-        """Move servo continuously while button is pressed"""
-        # Only proceed if button is still pressed
-        if button_id in self.button_states and self.button_states[button_id]:
-            # Parse button ID
+            # Stop the movement thread
+            thread_id = f"movement_{button_id}"
+            if thread_id in self.movement_threads:
+                self.movement_threads[thread_id] = False
+            
+            # Parse servo name
             parts = button_id.split()
             servo_name = parts[0]
-            direction = parts[1]  # CCW or CW
             
-            # Get servo pin
-            pin = self.SERVO_PINS[servo_name]
+            # If no buttons for this servo are pressed, turn it off
+            servo_still_active = False
+            for active_button in self.button_states:
+                if servo_name in active_button:
+                    servo_still_active = True
+                    break
             
+            if not servo_still_active:
+                pin = self.SERVO_PINS[servo_name]
+                self.pi.set_servo_pulsewidth(pin, 0)
+                self.active_servos.remove(servo_name)
+            
+            # If no buttons are pressed at all, update status
+            if not self.button_states:
+                self.servo_status.config(text="Ready - All servos off")
+
+    def move_servo_continuously(self, button_id, thread_id):
+        """Move servo continuously while button is pressed"""
+        # Parse button ID
+        parts = button_id.split()
+        servo_name = parts[0]
+        direction = parts[1]  # CCW or CW
+        
+        # Get servo pin and step size
+        pin = self.SERVO_PINS[servo_name]
+        step_size = self.STEP_SIZES[servo_name]  # Use servo-specific step size
+        interval = self.SPEED_INTERVALS[servo_name]  # Use servo-specific interval
+        
+        # Adjust for speed factor
+        effective_interval = interval / self.speed_factor.get()
+        
+        # Continue moving while thread is active
+        while self.movement_threads.get(thread_id, False):
             # Get current pulse width
             current = self.current_pw[servo_name]
             
@@ -382,25 +594,34 @@ class RoboticArmController:
             
             # Calculate new pulse width based on direction
             if direction == "CCW":
-                new_pw = min(current + self.DEFAULT_STEP, max_pw)
+                new_pw = min(current + step_size, max_pw)
             else:  # CW
-                new_pw = max(current - self.DEFAULT_STEP, min_pw)
+                new_pw = max(current - step_size, min_pw)
             
             # Update position if it changed
             if new_pw != current:
                 self.current_pw[servo_name] = new_pw
-                self.pi.set_servo_pulsewidth(pin, new_pw)
-                
-                # Update position label
-                self.position_labels[servo_name].config(text=f"{new_pw}μs")
+                try:
+                    self.pi.set_servo_pulsewidth(pin, new_pw)
+                    
+                    # Update position label in main thread
+                    self.root.after(0, lambda n=servo_name, p=new_pw: 
+                                   self.position_labels[n].config(text=f"{p}μs"))
+                except Exception as e:
+                    print(f"Error moving {servo_name}: {e}")
+                    # If error, exit the loop
+                    break
             
-            # Schedule the next movement if button is still pressed
-            self.root.after(self.DEFAULT_INTERVAL, 
-                           lambda: self.move_servo_continuously(button_id))
+            # Sleep for interval
+            time.sleep(effective_interval / 1000)  # Convert ms to seconds
 
     def cleanup(self):
         """Clean up resources when closing the application"""
         print("Cleaning up resources...")
+        
+        # Stop all movement threads
+        for thread_id in list(self.movement_threads.keys()):
+            self.movement_threads[thread_id] = False
         
         # Clear any button states
         self.button_states.clear()
