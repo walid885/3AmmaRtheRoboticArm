@@ -22,20 +22,22 @@ class RoboticArmController:
     
     # Min/Max pulse widths (in μs) for each servo
     SERVO_LIMITS = {
-        'BASE': (500, 2500),
-        'SHOULDER': (500, 2500),
-        'ELBOW': (500, 2500),
-        'WRIST_PITCH': (500, 2500),
-        'WRIST_ROLL': (500, 2500),
-        'GRIPPER': (1000, 2000)  # Closed to Open
+        'BASE': (600, 2400),
+        'SHOULDER': (700, 2300),  # MG996R Pro specific range
+        'ELBOW': (600, 2400),
+        'WRIST_PITCH': (600, 2400),
+        'WRIST_ROLL': (600, 2400),
+        'GRIPPER': (1000, 2000)   # Closed to Open
     }
     
     # Default step size and interval for servo movements
-    DEFAULT_STEP = 20      # Step size in μs
-    DEFAULT_INTERVAL = 50  # Interval between steps in ms
-    
+    DEFAULT_STEP = 10      # Smaller step size for smoother movement
+    DEFAULT_INTERVAL = 30  # Faster updates for more responsive control
+    COMMAND_DELAY = 0.08  # 30ms delay
+    ACCEL_STEPS = 5        # Number of steps for acceleration/deceleration
+        
     # Safety delay between servo commands to prevent signal interference
-    COMMAND_DELAY = 0.02   # 20ms delay
+    COMMAND_DELAY = 0.5   # 20ms delay
 
     def __init__(self, root):
         self.root = root
@@ -66,6 +68,96 @@ class RoboticArmController:
             
         self._setup_ui()
         logger.info("Robotic arm controller initialized and ready")
+    
+    def _move_with_acceleration(self, servo_name, target_pw):
+        """Move a servo with an acceleration/deceleration profile"""
+        pin = self.SERVO_PINS[servo_name]
+        current = self.current_pw[servo_name]
+        
+        # Calculate total movement and direction
+        total_move = target_pw - current
+        if total_move == 0:
+            return  # Already at target
+            
+        direction = 1 if total_move > 0 else -1
+        total_steps = abs(total_move)
+        
+        # Make acceleration profile
+        if total_steps <= 10:
+            # For very small movements, move directly
+            increments = [direction * 1] * total_steps
+        else:
+            # For larger movements, create an acceleration curve
+            accel_steps = min(self.ACCEL_STEPS, total_steps // 3)
+            
+            # Acceleration phase
+            accel = [direction * (i+1) for i in range(accel_steps)]
+            
+            # Constant velocity phase
+            mid_steps = total_steps - (2 * accel_steps)
+            constant = [direction * accel_steps] * max(0, mid_steps)
+            
+            # Deceleration phase
+            decel = [direction * (accel_steps - i) for i in range(accel_steps)]
+            
+            # Combine phases
+            increments = accel + constant + decel
+            
+            # Adjust for total distance
+            actual_distance = sum(increments)
+            if actual_distance != total_move:
+                adjustment = total_move - actual_distance
+                if mid_steps > 0:
+                    # Adjust the constant velocity phase
+                    constant = [direction * accel_steps] * (mid_steps + adjustment)
+                    increments = accel + constant + decel
+                else:
+                    # If no constant phase, adjust last increment
+                    increments[-1] += adjustment
+        
+        # Execute the movement profile
+        current_pos = current
+        for increment in increments:
+            current_pos += increment
+            
+            # Ensure within limits
+            min_pw, max_pw = self.SERVO_LIMITS[servo_name]
+            current_pos = max(min_pw, min(current_pos, max_pw))
+            
+            # Move servo
+            self.pi.set_servo_pulsewidth(pin, current_pos)
+            self.current_pw[servo_name] = current_pos
+            
+            # Update UI
+            self.root.after(0, lambda n=servo_name, p=current_pos: 
+                        self.position_labels[n].config(text=f"{p}μs"))
+            
+            # Power load monitoring
+            self._check_movement_frequency()
+            
+            # Delay based on power stability
+            delay = self.COMMAND_DELAY * (2.0 if not self.power_stable else 1.0)
+            time.sleep(delay)
+    def _check_movement_frequency(self):
+        """Check if movements are happening too frequently which might indicate power issues"""
+        current_time = time.time()
+        time_diff = current_time - self.last_movement_time
+        
+        # If movements are happening in rapid succession
+        if time_diff < 0.1:
+            self.movement_count += 1
+            
+            # If too many rapid movements, might indicate power issues
+            if self.movement_count > 20 and self.power_stable:
+                self.power_stable = False
+                self.root.after(0, lambda: self.power_status.config(
+                    text="Power: Unstable", bg="red"))
+                logger.warning("Possible power instability detected")
+        else:
+            # Reset counter for normal operation
+            self.movement_count = 0
+        
+        self.last_movement_time = current_time
 
     def _setup_ui(self):
         """Set up the user interface"""
@@ -456,7 +548,17 @@ class RoboticArmController:
                 self.servo_status.config(text="Ready")
 
     def move_servo_continuously(self, button_id):
-        """Move servo continuously while button is pressed"""
+        """Move servo continuously while button is pressed with acceleration control"""
+        # Initial delay to prevent bounce
+        time.sleep(0.05)
+        
+        # Skip if button already released
+        if button_id not in self.button_states:
+            return
+            
+        # Start with slow movements
+        current_step = self.DEFAULT_STEP // 2
+            
         with self.movement_lock:
             while button_id in self.button_states and self.button_states[button_id]:
                 # Parse button ID
@@ -464,20 +566,22 @@ class RoboticArmController:
                 servo_name = parts[0]
                 direction = parts[1]  # CCW or CW
                 
-                # Get servo pin
+                # Get servo pin and current position
                 pin = self.SERVO_PINS[servo_name]
-                
-                # Get current pulse width
                 current = self.current_pw[servo_name]
                 
                 # Get limits for this servo
                 min_pw, max_pw = self.SERVO_LIMITS[servo_name]
                 
+                # Gradually increase step size for acceleration
+                if current_step < self.DEFAULT_STEP:
+                    current_step += 1
+                
                 # Calculate new pulse width based on direction
                 if direction == "CCW":
-                    new_pw = min(current + self.DEFAULT_STEP, max_pw)
+                    new_pw = min(current + current_step, max_pw)
                 else:  # CW
-                    new_pw = max(current - self.DEFAULT_STEP, min_pw)
+                    new_pw = max(current - current_step, min_pw)
                 
                 # Update position if it changed
                 if new_pw != current:
@@ -493,11 +597,14 @@ class RoboticArmController:
                     
                     # Update position label in main thread
                     self.root.after(0, lambda n=servo_name, p=new_pw: 
-                                   self.position_labels[n].config(text=f"{p}μs"))
+                                self.position_labels[n].config(text=f"{p}μs"))
+                    
+                    # Check for potential power issues
+                    self._check_movement_frequency()
                 
-                # Wait before next movement
-                time.sleep(self.DEFAULT_INTERVAL / 1000)  # Convert ms to seconds
-
+                # Wait before next movement - adjust based on power stability
+                interval = self.DEFAULT_INTERVAL * (1.5 if not self.power_stable else 1.0)
+                time.sleep(interval / 1000)  # Convert ms to seconds
     def cleanup(self):
         """Clean up resources when closing the application"""
         logger.info("Cleaning up resources...")
@@ -516,6 +623,78 @@ class RoboticArmController:
             # Stop pigpio
             self.pi.stop()
             logger.info("All servo motors turned off.")
+    def calibrate_servos(self):
+        """Calibrate each servo to find its actual range"""
+        self.servo_status.config(text="Starting servo calibration...")
+        
+        # Stop any ongoing movements
+        self.button_states.clear()
+        
+        # Create a separate thread for calibration
+        threading.Thread(target=self._calibrate_servos_thread, daemon=True).start()
+    
+    def _calibrate_servos_thread(self):
+        """Thread function for calibrating each servo individually"""
+        try:
+            # For each servo, move slowly through entire range to detect limits
+            for name, pin in self.SERVO_PINS.items():
+                # Update status
+                self.root.after(0, lambda n=name: 
+                            self.servo_status.config(text=f"Calibrating {n}..."))
+                
+                min_pw, max_pw = self.SERVO_LIMITS[name]
+                
+                # First, move to center position gently
+                center = (min_pw + max_pw) // 2
+                self._move_with_acceleration(name, center)
+                time.sleep(1.0)  # Wait for stability
+                
+                # Then move slowly toward minimum
+                self.root.after(0, lambda n=name: 
+                            self.servo_status.config(text=f"Finding minimum for {n}..."))
+                
+                # Test lower range with extra caution
+                for test_pw in range(center, min_pw - 100, -10):
+                    # Safety boundary check
+                    if test_pw < min_pw - 50:
+                        break
+                        
+                    self.pi.set_servo_pulsewidth(pin, test_pw)
+                    self.current_pw[name] = test_pw
+                    self.root.after(0, lambda n=name, p=test_pw: 
+                                self.position_labels[n].config(text=f"{p}μs"))
+                    time.sleep(0.1)  # Slower movement for calibration
+                
+                # Return to center
+                self._move_with_acceleration(name, center)
+                time.sleep(1.0)
+                
+                # Test upper range
+                self.root.after(0, lambda n=name: 
+                            self.servo_status.config(text=f"Finding maximum for {n}..."))
+                
+                for test_pw in range(center, max_pw + 100, 10):
+                    # Safety boundary check
+                    if test_pw > max_pw + 50:
+                        break
+                        
+                    self.pi.set_servo_pulsewidth(pin, test_pw)
+                    self.current_pw[name] = test_pw
+                    self.root.after(0, lambda n=name, p=test_pw: 
+                                self.position_labels[n].config(text=f"{p}μs"))
+                    time.sleep(0.1)
+                
+                # Return to center again
+                self._move_with_acceleration(name, center)
+                time.sleep(1.0)
+            
+            # Complete calibration
+            self.root.after(0, lambda: self.servo_status.config(text="Calibration complete"))
+            logger.info("Servo calibration completed")
+            
+        except Exception as e:
+            logger.error(f"Error during calibration: {e}")
+            self.root.after(0, lambda: self.servo_status.config(text=f"Calibration error: {e}"))
 
 def main():
     # Check if pigpio daemon is running
