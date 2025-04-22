@@ -758,7 +758,7 @@ class RoboticArmController:
         self.root.destroy()
 
     # Create main application
-    if __name__ == "__main__":
+if __name__ == "__main__":
         root = tk.Tk()
         app = RoboticArmController(root)
         # Set closing handler
