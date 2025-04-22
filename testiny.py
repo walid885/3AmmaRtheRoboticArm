@@ -7,7 +7,7 @@ class RoboticArmController:
     # Servo pin configuration
     SERVO_PINS = {
         'BASE': 24,       # Base rotation
-        'SHOULDER': 23,   # Shoulder joint
+        'SHOULDER': 23,   # Shoulder joint (restricted to 40°-60°)
         'ELBOW': 22,      # Elbow joint
         'WRIST_PITCH': 27,  # Wrist up/down
         'WRIST_ROLL': 18,   # Wrist rotation
@@ -17,16 +17,25 @@ class RoboticArmController:
     # Min/Max pulse widths (in μs) for each servo
     SERVO_LIMITS = {
         'BASE': (500, 2500),
-        'SHOULDER': (500, 2500),
+        'SHOULDER': (500, 2500),  # We'll apply angle restrictions in code
         'ELBOW': (500, 2500),
         'WRIST_PITCH': (500, 2500),
         'WRIST_ROLL': (500, 2500),
         'GRIPPER': (1000, 2000)  # Closed to Open
     }
     
+    # Angle limits for shoulder (40° to 60°)
+    SHOULDER_MIN_ANGLE = 40
+    SHOULDER_MAX_ANGLE = 60
+    
     # Default step size and interval for servo movements
     DEFAULT_STEP = 20      # Step size in μs
     DEFAULT_INTERVAL = 50  # Interval between steps in ms
+    
+    # Conversion constants for shoulder
+    SHOULDER_MIN_PW = 500  # Pulse width for 0°
+    SHOULDER_MAX_PW = 2500  # Pulse width for 180°
+    SHOULDER_PW_PER_DEGREE = (SHOULDER_MAX_PW - SHOULDER_MIN_PW) / 180
 
     def __init__(self, root):
         self.root = root
@@ -40,6 +49,7 @@ class RoboticArmController:
         self.pi = None
         self.current_pw = {}
         self.position_labels = {}
+        self.angle_labels = {}
         
         # Set up UI only
         self._setup_ui()
@@ -55,9 +65,19 @@ class RoboticArmController:
         # Current pulse width for each servo
         self.current_pw = {pin_name: 1500 for pin_name in self.SERVO_PINS}
         
-        # Initialize all servos to middle position
+        # Set shoulder to middle of restricted range
+        shoulder_middle_angle = (self.SHOULDER_MIN_ANGLE + self.SHOULDER_MAX_ANGLE) / 2
+        shoulder_middle_pw = self.angle_to_pw('SHOULDER', shoulder_middle_angle)
+        self.current_pw['SHOULDER'] = shoulder_middle_pw
+        
+        # Initialize all servos
         for name, pin in self.SERVO_PINS.items():
             self.pi.set_servo_pulsewidth(pin, self.current_pw[name])
+            
+            # Update angle display
+            if name == 'SHOULDER':
+                angle = self.pw_to_angle('SHOULDER', self.current_pw[name])
+                self.angle_labels[name].config(text=f"{angle:.1f}°")
         
         self.servo_status.config(text="Hardware initialized")
         return True
@@ -102,6 +122,9 @@ class RoboticArmController:
         self.feedback_frame.pack(fill=tk.X, pady=10)
         
         self.position_labels = {}
+        self.angle_labels = {}
+        
+        # Create position and angle labels
         for i, name in enumerate(self.SERVO_PINS.keys()):
             row = i // 3
             col = i % 3
@@ -109,13 +132,26 @@ class RoboticArmController:
             label_frame = tk.Frame(self.feedback_frame, bg="#f0f0f0")
             label_frame.grid(row=row, column=col, padx=10, pady=5)
             
-            tk.Label(label_frame, text=f"{name}:", font=("Arial", 10), 
-                     bg="#f0f0f0").pack(side=tk.LEFT)
+            servo_label = tk.Label(label_frame, text=f"{name}:", font=("Arial", 10), 
+                     bg="#f0f0f0")
+            servo_label.pack(side=tk.LEFT)
             
             self.position_labels[name] = tk.Label(label_frame, text="N/A", 
-                                                  font=("Arial", 10), width=8, 
-                                                  bg="white", relief=tk.SUNKEN)
+                                                 font=("Arial", 10), width=8, 
+                                                 bg="white", relief=tk.SUNKEN)
             self.position_labels[name].pack(side=tk.LEFT, padx=5)
+            
+            # Add angle display for shoulder only
+            if name == 'SHOULDER':
+                self.angle_labels[name] = tk.Label(label_frame, text="N/A", 
+                                                   font=("Arial", 10), width=6,
+                                                   bg="#FFEEEE", relief=tk.SUNKEN)
+                self.angle_labels[name].pack(side=tk.LEFT, padx=5)
+                
+                # Add range indicator
+                range_label = tk.Label(label_frame, text=f"[{self.SHOULDER_MIN_ANGLE}°-{self.SHOULDER_MAX_ANGLE}°]", 
+                                      font=("Arial", 8), bg="#f0f0f0", fg="#CC0000")
+                range_label.pack(side=tk.LEFT, padx=2)
         
         # Create servo control sections
         controls_container = tk.Frame(main_frame, bg="#f0f0f0")
@@ -207,6 +243,27 @@ class RoboticArmController:
             self.servo_status.config(text="Hardware not initialized!")
             return False
         return True
+    
+    def angle_to_pw(self, servo_name, angle):
+        """Convert angle to pulse width for the given servo"""
+        if servo_name == 'SHOULDER':
+            # Ensure angle is within the allowed range
+            angle = max(self.SHOULDER_MIN_ANGLE, min(angle, self.SHOULDER_MAX_ANGLE))
+            return int(self.SHOULDER_MIN_PW + angle * self.SHOULDER_PW_PER_DEGREE)
+        else:
+            # Standard conversion for other servos (assuming 0-180° maps to min-max pulse width)
+            min_pw, max_pw = self.SERVO_LIMITS[servo_name]
+            return int(min_pw + (angle / 180.0) * (max_pw - min_pw))
+    
+    def pw_to_angle(self, servo_name, pw):
+        """Convert pulse width to angle for the given servo"""
+        if servo_name == 'SHOULDER':
+            angle = (pw - self.SHOULDER_MIN_PW) / self.SHOULDER_PW_PER_DEGREE
+            return max(self.SHOULDER_MIN_ANGLE, min(angle, self.SHOULDER_MAX_ANGLE))
+        else:
+            # Standard conversion for other servos
+            min_pw, max_pw = self.SERVO_LIMITS[servo_name]
+            return (pw - min_pw) * 180.0 / (max_pw - min_pw)
 
     def home_position(self):
         """Move all servos to home position"""
@@ -215,7 +272,7 @@ class RoboticArmController:
             
         home_positions = {
             'BASE': 1500,
-            'SHOULDER': 1500,
+            'SHOULDER': self.angle_to_pw('SHOULDER', 50),  # Middle of shoulder range (40°-60°)
             'ELBOW': 1500,
             'WRIST_PITCH': 1500,
             'WRIST_ROLL': 1500,
@@ -230,7 +287,7 @@ class RoboticArmController:
             
         pick_positions = {
             'BASE': 1800,
-            'SHOULDER': 1200,
+            'SHOULDER': self.angle_to_pw('SHOULDER', 40),  # Min shoulder angle
             'ELBOW': 1000,
             'WRIST_PITCH': 1700,
             'WRIST_ROLL': 1500,
@@ -245,7 +302,7 @@ class RoboticArmController:
             
         place_positions = {
             'BASE': 1200,
-            'SHOULDER': 1500,
+            'SHOULDER': self.angle_to_pw('SHOULDER', 60),  # Max shoulder angle
             'ELBOW': 1800,
             'WRIST_PITCH': 1300,
             'WRIST_ROLL': 1500,
@@ -260,7 +317,7 @@ class RoboticArmController:
             
         rest_positions = {
             'BASE': 1500,
-            'SHOULDER': 2000,
+            'SHOULDER': self.angle_to_pw('SHOULDER', 45),  # Within shoulder range
             'ELBOW': 2000,
             'WRIST_PITCH': 1500,
             'WRIST_ROLL': 1500,
@@ -297,17 +354,28 @@ class RoboticArmController:
                 pin = self.SERVO_PINS[name]
                 new_pw = int(current_positions[name] + increment * (step + 1))
                 
-                # Ensure within limits
-                min_pw, max_pw = self.SERVO_LIMITS[name]
-                new_pw = max(min_pw, min(new_pw, max_pw))
+                # For shoulder, make sure we're within range
+                if name == 'SHOULDER':
+                    angle = self.pw_to_angle(name, new_pw)
+                    new_pw = self.angle_to_pw(name, angle)  # This will enforce limits
+                else:
+                    # For other servos, ensure within limits
+                    min_pw, max_pw = self.SERVO_LIMITS[name]
+                    new_pw = max(min_pw, min(new_pw, max_pw))
                 
                 # Update position
                 self.current_pw[name] = new_pw
                 self.pi.set_servo_pulsewidth(pin, new_pw)
                 
                 # Update UI in main thread
-                self.root.after(0, lambda n=name, p=new_pw: 
-                               self.position_labels[n].config(text=f"{p}μs"))
+                if name == 'SHOULDER':
+                    angle = self.pw_to_angle(name, new_pw)
+                    self.root.after(0, lambda n=name, p=new_pw, a=angle: 
+                                   [self.position_labels[n].config(text=f"{p}μs"),
+                                    self.angle_labels[n].config(text=f"{a:.1f}°")])
+                else:
+                    self.root.after(0, lambda n=name, p=new_pw: 
+                                   self.position_labels[n].config(text=f"{p}μs"))
             
             time.sleep(0.02)  # 20ms between steps
         
@@ -340,7 +408,13 @@ class RoboticArmController:
             
         for name, pin in self.SERVO_PINS.items():
             self.pi.set_servo_pulsewidth(pin, self.current_pw[name])
-            self.position_labels[name].config(text=f"{self.current_pw[name]}μs")
+            
+            if name == 'SHOULDER':
+                angle = self.pw_to_angle(name, self.current_pw[name])
+                self.position_labels[name].config(text=f"{self.current_pw[name]}μs")
+                self.angle_labels[name].config(text=f"{angle:.1f}°")
+            else:
+                self.position_labels[name].config(text=f"{self.current_pw[name]}μs")
         
         self.servo_status.config(text="Ready")
 
@@ -405,14 +479,29 @@ class RoboticArmController:
             # Get current pulse width
             current = self.current_pw[servo_name]
             
-            # Get limits for this servo
-            min_pw, max_pw = self.SERVO_LIMITS[servo_name]
-            
             # Calculate new pulse width based on direction
-            if direction == "CCW":
-                new_pw = min(current + self.DEFAULT_STEP, max_pw)
-            else:  # CW
-                new_pw = max(current - self.DEFAULT_STEP, min_pw)
+            if servo_name == 'SHOULDER':
+                # For shoulder, we need to work with angles first to enforce limits
+                current_angle = self.pw_to_angle(servo_name, current)
+                
+                if direction == "CCW":
+                    new_angle = min(current_angle + 0.5, self.SHOULDER_MAX_ANGLE)
+                else:  # CW
+                    new_angle = max(current_angle - 0.5, self.SHOULDER_MIN_ANGLE)
+                
+                # Convert back to pulse width
+                new_pw = self.angle_to_pw(servo_name, new_angle)
+                
+                # Update angle display
+                self.angle_labels[servo_name].config(text=f"{new_angle:.1f}°")
+            else:
+                # For other servos, use standard min/max limits
+                min_pw, max_pw = self.SERVO_LIMITS[servo_name]
+                
+                if direction == "CCW":
+                    new_pw = min(current + self.DEFAULT_STEP, max_pw)
+                else:  # CW
+                    new_pw = max(current - self.DEFAULT_STEP, min_pw)
             
             # Update position if it changed
             if new_pw != current:

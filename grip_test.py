@@ -3,8 +3,8 @@ import time
 import tkinter as tk
 from tkinter import Scale, Label, Button, Frame
 
-# GPIO Pin for servo
-SERVO_PIN = 17
+# GPIO Pin for servo shoulder 
+SERVO_PIN = 23
 
 # Servo configuration parameters
 MIN_PULSE_WIDTH = 500    # Minimum pulse width in microseconds (0 degrees)
